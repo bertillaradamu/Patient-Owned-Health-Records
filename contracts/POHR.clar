@@ -73,6 +73,22 @@
   }
 )
 
+(define-map record-versions
+  { record-id: uint, version: uint }
+  {
+    record-hash: (buff 32),
+    version-timestamp: uint,
+    created-by: principal,
+    change-reason: (string-ascii 100),
+    is-current: bool
+  }
+)
+
+(define-map record-version-count
+  { record-id: uint }
+  { total-versions: uint, current-version: uint }
+)
+
 (define-map emergency-access
   { patient-id: principal }
   {
@@ -168,8 +184,23 @@
         is-encrypted: is-encrypted
       }
     )
+    (map-set record-versions
+      { record-id: record-id, version: u1 }
+      {
+        record-hash: record-hash,
+        version-timestamp: current-block,
+        created-by: patient-id,
+        change-reason: "initial-creation",
+        is-current: true
+      }
+    )
+    (map-set record-version-count
+      { record-id: record-id }
+      { total-versions: u1, current-version: u1 }
+    )
     (var-set next-record-id (+ record-id u1))
     (var-set total-records (+ (var-get total-records) u1))
+    (var-set block-counter (+ (var-get block-counter) u1))
     (ok record-id)
   )
 )
@@ -232,20 +263,42 @@
   )
 )
 
-(define-public (update-health-record (record-id uint) (new-record-hash (buff 32)))
+(define-public (update-health-record (record-id uint) (new-record-hash (buff 32)) (change-reason (string-ascii 100)))
   (let
     (
       (patient-id tx-sender)
       (current-block (var-get block-counter))
       (record (unwrap! (map-get? health-records { record-id: record-id }) err-not-found))
+      (version-info (unwrap! (map-get? record-version-count { record-id: record-id }) err-not-found))
+      (new-version (+ (get current-version version-info) u1))
     )
     (asserts! (is-eq (get patient-id record) patient-id) err-unauthorized)
+    (asserts! (> (len change-reason) u0) err-invalid-input)
+    (map-set record-versions
+      { record-id: record-id, version: (get current-version version-info) }
+      (merge (unwrap-panic (map-get? record-versions { record-id: record-id, version: (get current-version version-info) })) { is-current: false })
+    )
+    (map-set record-versions
+      { record-id: record-id, version: new-version }
+      {
+        record-hash: new-record-hash,
+        version-timestamp: current-block,
+        created-by: patient-id,
+        change-reason: change-reason,
+        is-current: true
+      }
+    )
+    (map-set record-version-count
+      { record-id: record-id }
+      { total-versions: new-version, current-version: new-version }
+    )
     (map-set health-records
       { record-id: record-id }
       (merge record { record-hash: new-record-hash, last-updated: current-block })
     )
     (log-access patient-id patient-id record-id "UPDATE_RECORD")
-    (ok true)
+    (var-set block-counter (+ (var-get block-counter) u1))
+    (ok new-version)
   )
 )
 
@@ -296,6 +349,48 @@
     )
     (log-access patient-id provider-id u0 "EXTEND_ACCESS")
     (ok true)
+  )
+)
+
+(define-public (rollback-record-version (record-id uint) (target-version uint) (rollback-reason (string-ascii 100)))
+  (let
+    (
+      (patient-id tx-sender)
+      (current-block (var-get block-counter))
+      (record (unwrap! (map-get? health-records { record-id: record-id }) err-not-found))
+      (version-info (unwrap! (map-get? record-version-count { record-id: record-id }) err-not-found))
+      (target-version-data (unwrap! (map-get? record-versions { record-id: record-id, version: target-version }) err-not-found))
+      (new-version (+ (get current-version version-info) u1))
+    )
+    (asserts! (is-eq (get patient-id record) patient-id) err-unauthorized)
+    (asserts! (> target-version u0) err-invalid-input)
+    (asserts! (<= target-version (get total-versions version-info)) err-invalid-input)
+    (asserts! (> (len rollback-reason) u0) err-invalid-input)
+    (map-set record-versions
+      { record-id: record-id, version: (get current-version version-info) }
+      (merge (unwrap-panic (map-get? record-versions { record-id: record-id, version: (get current-version version-info) })) { is-current: false })
+    )
+    (map-set record-versions
+      { record-id: record-id, version: new-version }
+      {
+        record-hash: (get record-hash target-version-data),
+        version-timestamp: current-block,
+        created-by: patient-id,
+        change-reason: rollback-reason,
+        is-current: true
+      }
+    )
+    (map-set record-version-count
+      { record-id: record-id }
+      { total-versions: new-version, current-version: new-version }
+    )
+    (map-set health-records
+      { record-id: record-id }
+      (merge record { record-hash: (get record-hash target-version-data), last-updated: current-block })
+    )
+    (log-access patient-id patient-id record-id "ROLLBACK_RECORD")
+    (var-set block-counter (+ (var-get block-counter) u1))
+    (ok new-version)
   )
 )
 
@@ -361,6 +456,40 @@
     total-records: (var-get total-records),
     current-block: (var-get block-counter)
   }
+)
+
+(define-read-only (get-record-version (record-id uint) (version uint))
+  (map-get? record-versions { record-id: record-id, version: version })
+)
+
+(define-read-only (get-record-version-count (record-id uint))
+  (map-get? record-version-count { record-id: record-id })
+)
+
+(define-read-only (get-current-record-version (record-id uint))
+  (let
+    (
+      (version-info (map-get? record-version-count { record-id: record-id }))
+    )
+    (match version-info
+      info
+      (map-get? record-versions { record-id: record-id, version: (get current-version info) })
+      none
+    )
+  )
+)
+
+(define-read-only (is-version-current (record-id uint) (version uint))
+  (let
+    (
+      (version-data (map-get? record-versions { record-id: record-id, version: version }))
+    )
+    (match version-data
+      data
+      (get is-current data)
+      false
+    )
+  )
 )
 
 (define-private (log-access (patient-id principal) (provider-id principal) (record-id uint) (action (string-ascii 20)))
