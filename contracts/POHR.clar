@@ -602,3 +602,92 @@
 (define-private (check-provider-access (patient-id principal))
   (is-some (map-get? access-permissions { patient-id: patient-id, provider-id: tx-sender }))
 )
+
+;; ------------------------------
+;; Health Metrics Tracking Feature
+;; Independent feature: allows patients to log time-stamped health metrics
+;; No cross-contract calls or traits; Clarity v3 compliant
+;; ------------------------------
+
+(define-constant err-empty-metric (err u200))
+(define-constant err-empty-unit (err u201))
+
+(define-data-var next-metric-id uint u1)
+
+(define-map health-metrics
+  { metric-id: uint }
+  {
+    patient-id: principal,
+    metric-type: (string-ascii 32),
+    value: uint,
+    unit: (string-ascii 10),
+    timestamp: uint
+  }
+)
+
+(define-map patient-metric-count
+  { patient-id: principal }
+  { count: uint }
+)
+
+(define-map patient-metric-index
+  { patient-id: principal, index: uint }
+  { metric-id: uint }
+)
+
+(define-public (log-health-metric (metric-type (string-ascii 32)) (value uint) (unit (string-ascii 10)))
+  (let
+    (
+      (patient-id tx-sender)
+      (metric-id (var-get next-metric-id))
+      (current-block (var-get block-counter))
+      (count-entry (map-get? patient-metric-count { patient-id: patient-id }))
+    )
+    (asserts! (is-some (map-get? patients { patient-id: patient-id })) err-unauthorized)
+    (asserts! (> (len metric-type) u0) err-empty-metric)
+    (asserts! (> (len unit) u0) err-empty-unit)
+
+    (map-set health-metrics
+      { metric-id: metric-id }
+      {
+        patient-id: patient-id,
+        metric-type: metric-type,
+        value: value,
+        unit: unit,
+        timestamp: current-block
+      }
+    )
+
+    (match count-entry
+      existing
+      (let ((next-index (+ (get count existing) u1)))
+        (map-set patient-metric-index { patient-id: patient-id, index: next-index } { metric-id: metric-id })
+        (map-set patient-metric-count { patient-id: patient-id } { count: next-index })
+        next-index
+      )
+      (begin
+        (map-set patient-metric-index { patient-id: patient-id, index: u1 } { metric-id: metric-id })
+        (map-set patient-metric-count { patient-id: patient-id } { count: u1 })
+        u1
+      )
+    )
+
+    (var-set next-metric-id (+ metric-id u1))
+    (var-set block-counter (+ (var-get block-counter) u1))
+    (ok metric-id)
+  )
+)
+
+(define-read-only (get-health-metric (metric-id uint))
+  (map-get? health-metrics { metric-id: metric-id })
+)
+
+(define-read-only (get-patient-metrics-count (patient-id principal))
+  (let ((entry (map-get? patient-metric-count { patient-id: patient-id })))
+    (match entry e (get count e) u0)
+  )
+)
+
+(define-read-only (get-patient-metric-id-at (patient-id principal) (index uint))
+  (map-get? patient-metric-index { patient-id: patient-id, index: index })
+)
