@@ -691,3 +691,157 @@
 (define-read-only (get-patient-metric-id-at (patient-id principal) (index uint))
   (map-get? patient-metric-index { patient-id: patient-id, index: index })
 )
+
+(define-constant err-rate-limit-exceeded (err u110))
+(define-constant err-invalid-token (err u111))
+(define-constant err-token-expired (err u112))
+(define-constant err-token-claimed (err u113))
+
+(define-data-var next-token-id uint u1)
+
+(define-map access-request-tokens
+  { token-id: uint }
+  {
+    provider-id: principal,
+    patient-id: principal,
+    expires-at: uint,
+    claimed: bool,
+    created-at: uint
+  }
+)
+
+(define-map token-rate-limits
+  { patient-id: principal }
+  {
+    request-count: uint,
+    window-start: uint
+  }
+)
+
+(define-public (create-access-request-token (provider-id principal))
+  (let
+    (
+      (patient-id tx-sender)
+      (current-block (var-get block-counter))
+      (expires-at (+ current-block u50))
+      (rate-limit (map-get? token-rate-limits { patient-id: patient-id }))
+      (token-id (var-get next-token-id))
+    )
+    (asserts! (is-some (map-get? patients { patient-id: patient-id })) err-unauthorized)
+    (asserts! (is-some (map-get? healthcare-providers { provider-id: provider-id })) err-not-found)
+    (match rate-limit
+      limit
+      (if (< current-block (+ (get window-start limit) u100))
+        (if (>= (get request-count limit) u5)
+          err-rate-limit-exceeded
+          (begin
+            (map-set token-rate-limits
+              { patient-id: patient-id }
+              { request-count: (+ (get request-count limit) u1), window-start: (get window-start limit) }
+            )
+            (map-set access-request-tokens
+              { token-id: token-id }
+              {
+                provider-id: provider-id,
+                patient-id: patient-id,
+                expires-at: expires-at,
+                claimed: false,
+                created-at: current-block
+              }
+            )
+            (var-set next-token-id (+ token-id u1))
+            (var-set block-counter (+ (var-get block-counter) u1))
+            (ok token-id)
+          )
+        )
+        (begin
+          (map-set token-rate-limits
+            { patient-id: patient-id }
+            { request-count: u1, window-start: current-block }
+          )
+          (map-set access-request-tokens
+            { token-id: token-id }
+            {
+              provider-id: provider-id,
+              patient-id: patient-id,
+              expires-at: expires-at,
+              claimed: false,
+              created-at: current-block
+            }
+          )
+          (var-set next-token-id (+ token-id u1))
+          (var-set block-counter (+ (var-get block-counter) u1))
+          (ok token-id)
+        )
+      )
+      (begin
+        (map-set token-rate-limits
+          { patient-id: patient-id }
+          { request-count: u1, window-start: current-block }
+        )
+        (map-set access-request-tokens
+          { token-id: token-id }
+          {
+            provider-id: provider-id,
+            patient-id: patient-id,
+            expires-at: expires-at,
+            claimed: false,
+            created-at: current-block
+          }
+        )
+        (var-set next-token-id (+ token-id u1))
+        (var-set block-counter (+ (var-get block-counter) u1))
+        (ok token-id)
+      )
+    )
+  )
+)
+
+(define-public (validate-access-token (token-id uint))
+  (let
+    (
+      (provider-id tx-sender)
+      (current-block (var-get block-counter))
+      (token (unwrap! (map-get? access-request-tokens { token-id: token-id }) err-invalid-token))
+    )
+    (asserts! (is-eq (get provider-id token) provider-id) err-unauthorized)
+    (asserts! (< current-block (get expires-at token)) err-token-expired)
+    (asserts! (not (get claimed token)) err-token-claimed)
+    (map-set access-request-tokens
+      { token-id: token-id }
+      (merge token { claimed: true })
+    )
+    (var-set block-counter (+ (var-get block-counter) u1))
+    (ok true)
+  )
+)
+
+(define-read-only (get-access-request-token (token-id uint))
+  (map-get? access-request-tokens { token-id: token-id })
+)
+
+(define-read-only (check-rate-limit-status (patient-id principal))
+  (let
+    (
+      (current-block (var-get block-counter))
+      (rate-limit (map-get? token-rate-limits { patient-id: patient-id }))
+    )
+    (match rate-limit
+      limit
+      (if (< current-block (+ (get window-start limit) u100))
+        {
+          is-limited: (>= (get request-count limit) u5),
+          current-requests: (get request-count limit)
+        }
+        {
+          is-limited: false,
+          current-requests: u0
+        }
+      )
+      {
+        is-limited: false,
+        current-requests: u0
+      }
+    )
+  )
+)

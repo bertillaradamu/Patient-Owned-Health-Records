@@ -66,6 +66,6 @@ plan:
         - emulated-contract-publish:
             contract-name: POHR
             emulated-sender: ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM
-            path: contracts/POHR.clar
+            path: "contracts\\POHR.clar"
             clarity-version: 3
       epoch: "3.2"
